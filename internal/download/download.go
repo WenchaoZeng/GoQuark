@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"strconv"
@@ -225,6 +226,10 @@ func downloadMultipart(ctx context.Context, hc *http.Client, dlURL, cookie, dest
 	// Buffered job queue: fixed workers pull continuously → no idle gap between parts.
 	// Queue depth > concurrency so a finishing worker always has the next part ready.
 	jobs := make(chan job, opt.Concurrency*4)
+	// stopJobs 在 downloadMultipart 返回时关闭
+	// 否则 worker 因错误提前退出后 分发协程会一直阻塞在 jobs <- 上造成 goroutine 泄漏
+	stopJobs := make(chan struct{})
+	defer close(stopJobs)
 	go func() {
 		defer close(jobs)
 		for off := int64(0); off < target; {
@@ -235,6 +240,8 @@ func downloadMultipart(ctx context.Context, hc *http.Client, dlURL, cookie, dest
 			if !pmap.done(off) {
 				select {
 				case <-ctx.Done():
+					return
+				case <-stopJobs:
 					return
 				case jobs <- job{off, end}:
 				}
@@ -503,10 +510,15 @@ func (r *speedReporter) Stop() {
 
 // --- part map ---
 
+// partMap 记录已完成分片
+// Done 会被 worker(写 mark)、任务分发协程(读 done)、落盘协程(json.Marshal) 并发访问
+// 因此所有访问都必须经过内置的读写锁 否则会触发 concurrent map read and map write
 type partMap struct {
 	PartSize int             `json:"part_size"`
 	Total    int64           `json:"total"`
 	Done     map[string]bool `json:"done"`
+
+	mu sync.RWMutex
 }
 
 func newPartMap(partSize int, total int64) *partMap {
@@ -529,34 +541,59 @@ func loadPartMap(dest string, partSize int, total int64) *partMap {
 	return &p
 }
 
+// savePartMap 序列化分片状态到磁盘
+// 使用 snapshot 在锁内拷贝 避免 json.Marshal 读到 worker 正在写的 map
 func savePartMap(dest string, p *partMap) error {
-	b, err := json.Marshal(p)
+	b, err := json.Marshal(p.snapshot())
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(partMapPath(dest), b, 0o600)
 }
 
+// snapshot 返回分片状态的深拷贝 可安全地并发序列化
+func (p *partMap) snapshot() *partMap {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	cp := &partMap{
+		PartSize: p.PartSize,
+		Total:    p.Total,
+		Done:     make(map[string]bool, len(p.Done)),
+	}
+	maps.Copy(cp.Done, p.Done)
+	return cp
+}
+
 func (p *partMap) key(start int64) string {
 	return fmt.Sprintf("%d", start)
 }
 
+// done 判断某分片是否已完成 读锁保护
 func (p *partMap) done(start int64) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.Done[p.key(start)]
 }
 
+// mark 标记某分片已完成 写锁保护
 func (p *partMap) mark(start int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.Done[p.key(start)] = true
 }
 
+// completedBytes 统计已完成字节数 读锁保护
 func (p *partMap) completedBytes() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	var n int64
 	for off := int64(0); off < p.Total; {
 		end := off + int64(p.PartSize) - 1
 		if end >= p.Total {
 			end = p.Total - 1
 		}
-		if p.done(off) {
+		// 直接在锁内查 map 不能调用 p.done 以避免 RLock 重入
+		if p.Done[p.key(off)] {
 			n += end - off + 1
 		}
 		off = end + 1
