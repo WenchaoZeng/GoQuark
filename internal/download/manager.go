@@ -97,6 +97,9 @@ type PersistTask struct {
 // maxFinishedKeep caps completed/cancelled rows kept on disk (active always kept).
 const maxFinishedKeep = 200
 
+// maxConcurrentFiles 限制同时下载的文件数，避免递归下载耗尽连接和磁盘资源
+const maxConcurrentFiles = 3
+
 // Manager tracks concurrent downloads for TUI + CLI.
 type Manager struct {
 	mu        sync.RWMutex
@@ -106,6 +109,7 @@ type Manager struct {
 	destDir   string
 	statePath string
 	loaded    bool
+	slots     chan struct{}
 	// optional: re-resolve URL from fid on resume
 	ResolveURL func(fid string) (url string, total int64, err error)
 }
@@ -125,11 +129,12 @@ func Global() *Manager {
 	return global
 }
 
+// NewManager 创建带有文件级并发限制的下载管理器
 func NewManager(c *client.Client, destDir string) *Manager {
 	if destDir == "" {
 		destDir = "downloads"
 	}
-	m := &Manager{client: c, destDir: destDir}
+	m := &Manager{client: c, destDir: destDir, slots: make(chan struct{}, maxConcurrentFiles)}
 	m.statePath = defaultStatePath()
 	return m
 }
@@ -210,10 +215,20 @@ func (m *Manager) EnqueueEx(opt EnqueueOpts) (*Task, error) {
 	}
 	dest := opt.Dest
 	if dest == "" {
-		_ = os.MkdirAll(m.destDir, 0o755)
 		dest = filepath.Join(m.destDir, sanitize(opt.Name))
-	} else {
-		_ = os.MkdirAll(filepath.Dir(dest), 0o755)
+	}
+	// 即使不同云盘节点映射到相同本地路径，也不能同时写入同一文件
+	for _, existing := range m.tasks {
+		if filepath.Clean(existing.Dest) != filepath.Clean(dest) {
+			continue
+		}
+		switch existing.Status {
+		case StatusRunning, StatusQueued, StatusFinalizing, StatusPausing:
+			return nil, fmt.Errorf("目标路径已有下载任务：%s", dest)
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return nil, fmt.Errorf("创建下载目录：%w", err)
 	}
 	m.seq++
 	id := fmt.Sprintf("dl-%d-%d", time.Now().Unix()%100000, m.seq)
@@ -227,21 +242,27 @@ func (m *Manager) EnqueueEx(opt EnqueueOpts) (*Task, error) {
 		CreatedAt: time.Now(),
 	}
 	m.tasks = append(m.tasks, t)
-	cl := m.client
-	go m.run(cl, t, false)
+	m.startLocked(m.client, t, false)
 	_ = m.saveLocked()
 	return t, nil
 }
 
-func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
+// startLocked 在启动协程前登记任务，保证暂停和退出能够等待排队任务结束
+func (m *Manager) startLocked(cl *client.Client, t *Task, resume bool) {
 	t.wg.Add(1)
 	t.running.Store(true)
+	go m.run(cl, t, resume)
+}
+
+// run 等待文件并发名额后再解析链接并执行下载
+func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 	defer func() {
 		t.running.Store(false)
 		t.wg.Done()
 	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	m.mu.Lock()
 	// Only abort if cancelled while waiting to start.
@@ -259,6 +280,19 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 		return
 	}
 	t.cancel = cancel
+	m.mu.Unlock()
+	select {
+	case m.slots <- struct{}{}:
+		defer func() { <-m.slots }()
+	case <-ctx.Done():
+		return
+	}
+	m.mu.Lock()
+	// 排队期间可能已经被暂停或取消，取得名额后必须再次确认
+	if ctx.Err() != nil || t.Status != StatusQueued {
+		m.mu.Unlock()
+		return
+	}
 	t.Status = StatusRunning
 	// first start or resume: mark segment start for elapsed accumulation
 	t.StartedAt = time.Now()
@@ -270,8 +304,10 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 	m.mu.Unlock()
 
 	// refresh URL if we have fid resolver (CDN links expire)
+	var resolveErr error
 	if (urlStr == "" || resume) && fid != "" && resolve != nil {
 		u, _, err := resolve(fid)
+		resolveErr = err
 		if err == nil && u != "" {
 			urlStr = u
 			m.mu.Lock()
@@ -279,29 +315,34 @@ func (m *Manager) run(cl *client.Client, t *Task, resume bool) {
 			m.mu.Unlock()
 		}
 	}
-	if urlStr == "" {
-		m.finish(t, StatusError, fmt.Errorf("empty download url"))
-		return
-	}
-
-	// try download; on failure refresh CDN URL once and retry (common for small files)
-	err := File(ctx, cl, urlStr, dest, Options{
-		Resume: resume,
-		OnProgress: func(done, total int64, speed float64) {
-			t.doneAt.Store(done)
-			m.mu.Lock()
-			t.Done = done
-			t.Total = total
-			t.Speed = speed
-			// When bytes hit 100% but File() has not returned, we are flushing/closing.
-			// Surface that so TUI can show spinner instead of stuck "下载中 100%".
-			if t.Status == StatusRunning && total > 0 && done >= total {
-				t.Status = StatusFinalizing
-				t.Speed = 0
+	// 解析链接失败或被取消时也走统一收尾，保留真实错误和暂停状态
+	err := func() error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if urlStr == "" {
+			if resolveErr != nil {
+				return resolveErr
 			}
-			m.mu.Unlock()
-		},
-	})
+			return fmt.Errorf("empty download url")
+		}
+		return File(ctx, cl, urlStr, dest, Options{
+			Resume: resume,
+			OnProgress: func(done, total int64, speed float64) {
+				t.doneAt.Store(done)
+				m.mu.Lock()
+				t.Done = done
+				t.Total = total
+				t.Speed = speed
+				// 收到全部字节后仍需等待落盘，避免显示为卡在 100%
+				if t.Status == StatusRunning && total > 0 && done >= total {
+					t.Status = StatusFinalizing
+					t.Speed = 0
+				}
+				m.mu.Unlock()
+			},
+		})
+	}()
 	if err != nil && ctx.Err() == nil && fid != "" && resolve != nil {
 		if u, _, rerr := resolve(fid); rerr == nil && u != "" && u != urlStr {
 			urlStr = u
@@ -561,8 +602,12 @@ func (m *Manager) cancelMany(ids map[string]bool, wait bool) int {
 // ResumeID resumes one paused/error task.
 func (m *Manager) ResumeID(id string) bool {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	var t *Task
 	cl := m.client
+	if cl == nil {
+		return false
+	}
 	for _, x := range m.tasks {
 		// allow retry on any error, and resume paused/incomplete
 		if x.ID != id {
@@ -575,7 +620,6 @@ func (m *Manager) ResumeID(id string) bool {
 			continue
 		}
 		if x.running.Load() {
-			m.mu.Unlock()
 			return false
 		}
 		// CRITICAL: must leave StatusPaused before go run().
@@ -587,11 +631,10 @@ func (m *Manager) ResumeID(id string) bool {
 		t = x
 		break
 	}
-	m.mu.Unlock()
-	if t == nil || cl == nil {
+	if t == nil {
 		return false
 	}
-	go m.run(cl, t, true)
+	m.startLocked(cl, t, true)
 	return true
 }
 
@@ -837,10 +880,43 @@ func (m *Manager) LoadPersisted() ([]PersistTask, error) {
 // FindByFIDInDir returns the newest task with same FID whose dest is under destDir.
 // destDir compared via filepath.Clean. Empty fid returns nil.
 func (m *Manager) FindByFIDInDir(fid, destDir string) *Snapshot {
+	destDir = filepath.Clean(destDir)
+	return m.findByFID(fid, func(dest string) bool {
+		return filepath.Clean(filepath.Dir(dest)) == destDir
+	})
+}
+
+// FindByFIDAtDest 仅匹配相同文件和完整目标路径，避免不同递归路径之间误去重
+func (m *Manager) FindByFIDAtDest(fid, dest string) *Snapshot {
+	dest = filepath.Clean(dest)
+	return m.findByFID(fid, func(candidate string) bool {
+		return filepath.Clean(candidate) == dest
+	})
+}
+
+// FindActiveAtDest 查询正在占用目标路径的任务，避免冲突替换时删除下载中的文件
+func (m *Manager) FindActiveAtDest(dest string) *Snapshot {
+	dest = filepath.Clean(dest)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, task := range m.tasks {
+		if filepath.Clean(task.Dest) != dest {
+			continue
+		}
+		switch task.Status {
+		case StatusRunning, StatusQueued, StatusFinalizing, StatusPausing:
+			snapshot := snap(task)
+			return &snapshot
+		}
+	}
+	return nil
+}
+
+// findByFID 按路径条件查找文件任务，优先返回活动任务
+func (m *Manager) findByFID(fid string, matches func(string) bool) *Snapshot {
 	if fid == "" {
 		return nil
 	}
-	destDir = filepath.Clean(destDir)
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var best *Task
@@ -848,7 +924,7 @@ func (m *Manager) FindByFIDInDir(fid, destDir string) *Snapshot {
 		if t.FID != fid {
 			continue
 		}
-		if filepath.Clean(filepath.Dir(t.Dest)) != destDir {
+		if !matches(t.Dest) {
 			continue
 		}
 		// prefer active/paused over done; among same class take last
@@ -913,10 +989,15 @@ func (m *Manager) ResumeQuitPaused() int {
 	return m.resumePaused(false)
 }
 
+// resumePaused 将符合恢复条件的任务重新排队，沿用相同的文件级并发限制
 func (m *Manager) resumePaused(all bool) int {
 	m.mu.Lock()
-	var toStart []*Task
+	defer m.mu.Unlock()
 	cl := m.client
+	if cl == nil {
+		return 0
+	}
+	n := 0
 	for _, t := range m.tasks {
 		switch t.Status {
 		case StatusPaused:
@@ -938,15 +1019,7 @@ func (m *Manager) resumePaused(all bool) int {
 		t.Error = ""
 		t.Speed = 0
 		t.AutoPausedByQuit = false // clear once we resume
-		toStart = append(toStart, t)
-	}
-	m.mu.Unlock()
-	if cl == nil {
-		return 0
-	}
-	n := 0
-	for _, t := range toStart {
-		go m.run(cl, t, true)
+		m.startLocked(cl, t, true)
 		n++
 	}
 	return n

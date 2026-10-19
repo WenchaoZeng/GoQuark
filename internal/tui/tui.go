@@ -178,6 +178,10 @@ type model struct {
 	dlBusy bool
 	dlMsg  string
 	dlMgr  *download.Manager
+	// 扫描状态与取消函数，防止重复提交及退出登录后处理过期扫描结果
+	dlPreparing     bool
+	dlPrepareID     uint64
+	dlPrepareCancel context.CancelFunc
 	// downloads center cursor
 	dlCursor int
 	// startup resume prompt
@@ -237,10 +241,11 @@ type dlJob struct {
 	replace              bool // delete existing dest before download
 }
 type dlEnqueueMsg struct {
-	jobs     []dlJob
-	focusID  string // jump/highlight existing task
-	status   string
-	err      error
+	prepareID uint64
+	jobs      []dlJob
+	focusID   string // jump/highlight existing task
+	status    string
+	err       error
 	// conflicts deferred to UI
 	conflicts []dlConflict
 }
@@ -590,6 +595,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tickDownloads()
 
 	case dlEnqueueMsg:
+		if msg.prepareID != 0 {
+			if !m.dlPreparing || msg.prepareID != m.dlPrepareID || m.quitting {
+				return m, nil
+			}
+			m.cancelDownloadPreparation()
+		}
 		if msg.err != nil {
 			if client.IsAuthError(msg.err) {
 				m.cfg.ClearSession()
@@ -618,6 +629,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var lastID string
 		for _, j := range msg.jobs {
 			if j.replace {
+				if m.dlMgr.FindActiveAtDest(j.dest) != nil {
+					return m.showModal("下载失败", "目标路径已有下载任务："+j.dest, "error", modeDownloads), nil
+				}
 				_ = os.Remove(j.dest)
 				_ = os.Remove(j.dest + ".gqparts")
 			}
@@ -1677,6 +1691,9 @@ func (m model) resolveConflict(replace bool) (tea.Model, tea.Cmd) {
 	m.conflictQ = m.conflictQ[1:]
 	dest := c.dest
 	if replace {
+		if m.dlMgr != nil && m.dlMgr.FindActiveAtDest(dest) != nil {
+			return m.showModal("下载失败", "目标路径已有下载任务："+dest, "error", modeDownloads), nil
+		}
 		_ = os.Remove(dest)
 		_ = os.Remove(dest + ".gqparts")
 	} else {
@@ -1709,6 +1726,7 @@ func (m model) resolveConflict(replace bool) (tea.Model, tea.Cmd) {
 // beginQuit pauses active downloads then quits.
 // Wait runs in a tea.Cmd (background), TUI keeps spinning until done.
 func (m model) beginQuit() (tea.Model, tea.Cmd) {
+	m.cancelDownloadPreparation()
 	if m.dlMgr == nil || m.dlMgr.ActiveCount() == 0 {
 		return m, tea.Quit
 	}
@@ -1751,7 +1769,9 @@ func (m model) fetchProfile() tea.Cmd {
 	}
 }
 
+// doLogout 取消尚未提交的扫描并清理登录状态
 func (m model) doLogout() (tea.Model, tea.Cmd) {
+	m.cancelDownloadPreparation()
 	m.cfg.ClearSession()
 	_ = m.cfg.Save()
 	m.mode = modeLogin
@@ -1813,31 +1833,33 @@ func (m model) selectedFileCount() int {
 	return n
 }
 
-func (m model) selectedFiles() []row {
-	// if multi selection has files, use them; else cursor file
-	var out []row
-	for i, on := range m.selected {
-		if !on || i < 0 || i >= len(m.rows) {
+// selectedDownloadEntries 优先采用勾选项，没有有效勾选项时使用光标项，始终排除返回上级
+func (m model) selectedDownloadEntries() []api.FileEntry {
+	var out []api.FileEntry
+	for i, r := range m.rows {
+		if !m.selected[i] || r.entry.Name == ".." {
 			continue
 		}
-		r := m.rows[i]
-		if !r.entry.Dir && r.entry.Name != ".." {
-			out = append(out, r)
-		}
+		out = append(out, r.entry)
 	}
-	if len(out) == 0 && len(m.rows) > 0 {
+	if len(out) == 0 && m.cursor >= 0 && m.cursor < len(m.rows) {
 		r := m.rows[m.cursor]
-		if !r.entry.Dir && r.entry.Name != ".." {
-			out = append(out, r)
+		if r.entry.Name != ".." {
+			out = append(out, r.entry)
 		}
 	}
 	return out
 }
 
+// doDownload 异步扫描所选文件夹并按原有目录结构准备下载任务
 func (m model) doDownload() (tea.Model, tea.Cmd) {
-	files := m.selectedFiles()
-	if len(files) == 0 {
-		m.status = "请选择文件再下载"
+	if m.dlPreparing {
+		return m, nil
+	}
+	entries := m.selectedDownloadEntries()
+	if len(entries) == 0 {
+		m.status = "请选择文件或文件夹再下载"
+		m.dlMsg = m.status
 		return m, nil
 	}
 	// always refresh dest dir from config (user may have changed download_dir)
@@ -1845,12 +1867,29 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 	if m.dlMgr == nil {
 		m.dlMgr = download.Global()
 		m.dlMgr.BindClient(m.client)
+		cl := m.client
+		m.dlMgr.ResolveURL = func(fid string) (string, int64, error) {
+			return api.GetDownloadURL(cl, fid)
+		}
 	}
 	m.dlMgr.SetDestDir(destDir)
 	cl := m.client
 	mgr := m.dlMgr
-	return m, func() tea.Msg {
-		_ = os.MkdirAll(destDir, 0o755)
+	ctx, cancel := context.WithCancel(context.Background())
+	m.dlPreparing = true
+	m.dlPrepareID++
+	m.dlPrepareCancel = cancel
+	prepareID := m.dlPrepareID
+	prepare := func() dlEnqueueMsg {
+		plan, err := download.BuildPlan(ctx, entries, func(fid string, page, size int) ([]api.FileEntry, error) {
+			return api.ListDir(cl, fid, page, size)
+		})
+		if err != nil {
+			return dlEnqueueMsg{err: err}
+		}
+		if err := plan.CreateDirectories(ctx, destDir); err != nil {
+			return dlEnqueueMsg{err: err}
+		}
 		// drop done records whose files are gone (before dedupe checks)
 		if n := mgr.ClearStaleDone(); n > 0 {
 			// silent cleanup; notes below if user re-downloads same file
@@ -1860,14 +1899,26 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 		var conflicts []dlConflict
 		var focusID string
 		var notes []string
-		for _, f := range files {
-			fid := f.entry.FID
-			name := f.entry.Name
-			dest := filepath.Join(destDir, sanitizeName(name))
+		for _, f := range plan.Files {
+			if err := ctx.Err(); err != nil {
+				return dlEnqueueMsg{err: err}
+			}
+			fid := f.Entry.FID
+			name := f.RelativePath
+			dest := filepath.Join(destDir, f.RelativePath)
+			if active := mgr.FindActiveAtDest(dest); active != nil && active.FID != fid {
+				return dlEnqueueMsg{err: fmt.Errorf("目标路径已有其他文件的下载任务：%s", dest)}
+			}
+			info, statErr := os.Lstat(dest)
+			if statErr != nil && !os.IsNotExist(statErr) {
+				return dlEnqueueMsg{err: fmt.Errorf("检查目标文件 %s：%w", dest, statErr)}
+			}
+			if statErr == nil && !info.Mode().IsRegular() {
+				return dlEnqueueMsg{err: fmt.Errorf("目标文件被目录或符号链接占用：%s", dest)}
+			}
 
-			// Dedup only within the CURRENT download_dir.
-			// Changing download_dir allows a fresh download of the same FID.
-			if existing := mgr.FindByFIDInDir(fid, destDir); existing != nil {
+			// 相同 FID 保存到不同递归路径时不能互相去重
+			if existing := mgr.FindByFIDAtDest(fid, dest); existing != nil {
 				// Done but local file missing → drop record and re-download
 				if existing.Status == download.StatusDone {
 					if _, err := os.Stat(existing.Dest); err != nil {
@@ -1898,7 +1949,7 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 					}
 				} else {
 					switch existing.Status {
-					case download.StatusRunning, download.StatusQueued, download.StatusFinalizing:
+					case download.StatusRunning, download.StatusQueued, download.StatusFinalizing, download.StatusPausing:
 						focusID = existing.ID
 						notes = append(notes, fmt.Sprintf("「%s」已在下载中", name))
 						continue
@@ -1935,11 +1986,8 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 				continue
 			}
 
-			urlStr, _, err := api.GetDownloadURL(cl, fid)
-			if err != nil {
-				return dlEnqueueMsg{err: fmt.Errorf("%s: %w", name, err)}
-			}
-			jobs = append(jobs, dlJob{name: name, url: urlStr, dest: dest, fid: fid})
+			// 排队时只保存 FID，实际取得下载名额后再获取链接
+			jobs = append(jobs, dlJob{name: name, dest: dest, fid: fid})
 		}
 
 		status := ""
@@ -1949,11 +1997,28 @@ func (m model) doDownload() (tea.Model, tea.Cmd) {
 		if len(jobs) == 0 && len(conflicts) == 0 {
 			if status == "" {
 				status = "没有新的下载任务"
+				if len(plan.Directories) > 0 && len(plan.Files) == 0 {
+					status = fmt.Sprintf("已创建 %d 个空文件夹", len(plan.Directories))
+				}
 			}
 			return dlEnqueueMsg{focusID: focusID, status: status}
 		}
 		return dlEnqueueMsg{jobs: jobs, conflicts: conflicts, focusID: focusID, status: status}
 	}
+	return m, func() tea.Msg {
+		msg := prepare()
+		msg.prepareID = prepareID
+		return msg
+	}
+}
+
+// cancelDownloadPreparation 取消扫描并使后续返回的旧扫描结果失效
+func (m *model) cancelDownloadPreparation() {
+	if m.dlPrepareCancel != nil {
+		m.dlPrepareCancel()
+	}
+	m.dlPreparing = false
+	m.dlPrepareCancel = nil
 }
 
 func fileSize(path string) int64 {
@@ -2056,6 +2121,9 @@ func (m model) viewBrowse() string {
 	if m.loading && m.status != "" {
 		foot = m.spinner.View() + " " + m.status
 	}
+	if m.dlPreparing {
+		foot = m.spinner.View() + " 正在扫描文件夹并准备下载…"
+	}
 	if selN := len(m.selected); selN > 0 {
 		foot = fmt.Sprintf("已选 %d  ·  %s", selN, foot)
 	}
@@ -2092,7 +2160,7 @@ func (m model) viewDownloads() string {
 	}
 	if len(list) == 0 {
 		b.WriteString("\n")
-		b.WriteString(helpStyle.Render("暂无下载任务。在网盘选中文件后按 d 开始下载。"))
+		b.WriteString(helpStyle.Render("暂无下载任务。在网盘选中文件或文件夹后按 d 开始下载。"))
 		b.WriteString("\n")
 		b.WriteString(helpStyle.Render("可在 ~/.config/goquark/config.json 修改 download_dir"))
 		b.WriteString("\n\n")
