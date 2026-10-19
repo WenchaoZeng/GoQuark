@@ -241,7 +241,7 @@ stdio server: host runs `goquark mcp` (**absolute path** required).
 
 | Item | Detail |
 |------|--------|
-| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.3**) |
+| Source of truth | Root [`VERSION`](VERSION) (currently **1.0.5**) |
 | Build inject | `scripts/build.sh` / CI via `-ldflags` |
 | Local `go run` | Shows `dev` if not injected |
 
